@@ -1,451 +1,548 @@
+# app.py
 """
-Advanced RAG (Retrieval Augmented Generation) Chatbot application using Streamlit.
+Streamlit-based chatbot application featuring RAG (Retrieval Augmented Generation)
+and response generation via the `smol_dev` library.
 
-Features:
-- Supports multiple LLM providers: OpenAI and local Ollama models.
-- Allows document upload (PDF, TXT, MD) for RAG.
-- Processes documents, creates vector stores (ChromaDB), and retrieves relevant context.
-- Streams responses from LLMs for a more interactive experience.
-- Handles errors gracefully and provides user feedback.
-- Session state management for chat history and RAG components.
+Application Purpose:
+--------------------
+This application serves as an interactive chatbot that can answer user queries.
+It leverages the `smol_dev` library for generating responses, which is an
+experimental approach for direct chat/text generation as `smol_dev` is primarily
+designed for code generation. The integration attempts to guide `smol_dev` to
+produce textual answers by prompting it to write its response to a conceptual
+file named "answer.txt".
+
+Key Features:
+-------------
+- Multi-Model Support: Allows selection between OpenAI models (e.g., gpt-4o, gpt-3.5-turbo)
+  and locally hosted Ollama models.
+- RAG Pipeline:
+    - Users can upload documents (PDF, TXT, MD).
+    - Documents are processed (loaded, chunked) and a vector store (ChromaDB)
+      is created using appropriate embeddings (OpenAI or Ollama).
+    - Retrieved context from these documents can be used to inform the AI's response.
+- `smol_dev` for Response Generation:
+    - The core response generation logic uses `smol_dev`'s `plan`, `specify_file_paths`,
+      and `generate_code_sync` functions.
+    - This is an **experimental use case** for `smol_dev`. The prompts are engineered
+      to make `smol_dev` output a textual answer rather than code.
+    - Environment variables (`OPENAI_API_KEY`, `OPENAI_API_BASE`, `OPENAI_MODEL_NAME`)
+      are manipulated to direct `smol_dev` to use the selected model (OpenAI or,
+      experimentally, an Ollama model via an OpenAI-compatible API endpoint).
+- Ollama Integration:
+    - Lists available Ollama models.
+    - Attempts to use selected Ollama models for both chat response generation
+      (via `smol_dev`'s experimental OpenAI API compatibility) and for embeddings in the RAG pipeline.
+      Success with `smol_dev` and Ollama is not guaranteed and depends on the Ollama
+      server's OpenAI API compatibility and `smol_dev`'s internal handling of API calls.
+- Streamlit UI: Provides a user-friendly interface for model selection, file upload,
+  and chat interaction.
+- Error Handling & Feedback: Includes mechanisms to handle missing libraries (`smol_dev`),
+  API key issues, model connection problems, and RAG processing failures, providing
+  feedback to the user through the UI.
+
+Experimental Aspects:
+---------------------
+- Using `smol_dev` for direct textual chat response generation.
+- Attempting to make `smol_dev` (which is primarily an OpenAI-focused tool)
+  interact with Ollama models by setting `OPENAI_API_BASE` and other relevant
+  environment variables to point to an Ollama server's OpenAI-compatible endpoint.
+- Using the selected Ollama chat model for generating embeddings in the RAG pipeline;
+  dedicated embedding models are generally preferred for Ollama but this app simplifies
+  by using the chat model for both for experimental purposes.
+
+Dependencies:
+-------------
+Requires Streamlit, Langchain components, OpenAI, Ollama, ChromaDB, PyPDF, Tiktoken,
+and `smol_dev`. Ensure `requirements.txt` is used for installation.
+The `OPENAI_API_KEY` environment variable must be set for OpenAI model usage.
+An Ollama server should be running with desired models pulled for Ollama usage.
 """
 import streamlit as st
-import ollama
-import openai
-import tempfile
 import os
+import tempfile
+
+# For RAG pipeline
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.document_loaders import PyPDFLoader, TextLoader
 from langchain_community.vectorstores import Chroma
-from langchain_openai import OpenAIEmbeddings, ChatOpenAI
-from langchain_community.embeddings import OllamaEmbeddings
-from langchain.prompts import ChatPromptTemplate, PromptTemplate
-from langchain_core.output_parsers import StrOutputParser
-from langchain_core.runnables import RunnablePassthrough
-from langchain.load import dumps, loads # For potential future use with serialization
+from langchain_openai import OpenAIEmbeddings
+from langchain_community.embeddings import OllamaEmbeddings # Assuming smol_dev won't handle Ollama embeddings
 
-# --- Configuration ---
-# OpenAI API key is expected to be set as an environment variable `OPENAI_API_KEY`.
-# Ollama server is expected to be running for local model access.
+# Placeholder for smol_dev imports - will be used later
+# from smol_dev.prompts import plan, specify_file_paths, generate_code_sync
 
-# --- Ollama Integration ---
-def get_ollama_models():
+# --- Environment Setup ---
+# Ensure OPENAI_API_KEY is available in the environment for OpenAI models/embeddings.
+# For Ollama, ensure the Ollama server is running and models are pulled.
+
+import ollama # Top-level import for use in get_ollama_models_list and OllamaEmbeddings
+# Attempt to import smol_dev; handle if not installed.
+# This is crucial for the application's core response generation logic.
+try:
+    from smol_dev.prompts import plan, specify_file_paths, generate_code_sync
+    SMOL_DEV_AVAILABLE = True
+except ImportError:
+    SMOL_DEV_AVAILABLE = False
+    # Define dummy functions if smol_dev is not available.
+    # This allows the Streamlit app to load and display a warning,
+    # rather than crashing outright if smol_dev is missing.
+    def plan(prompt):
+        st.error("CRITICAL: smol_dev library not found or failed to import. This app requires smol_dev. Please install it.")
+        raise NotImplementedError("smol_dev not available")
+    def specify_file_paths(prompt, shared_deps):
+        st.error("CRITICAL: smol_dev library not found or failed to import. This app requires smol_dev. Please install it.")
+        raise NotImplementedError("smol_dev not available")
+    def generate_code_sync(prompt, shared_deps, file_path):
+        st.error("CRITICAL: smol_dev library not found or failed to import. This app requires smol_dev. Please install it.")
+        raise NotImplementedError("smol_dev not available")
+
+# --- Environment Variable Management for smol_dev ---
+# Store original OpenAI environment variables at startup.
+# This is to ensure that manipulations for smol_dev calls (especially for Ollama)
+# do not permanently alter the environment for other parts of the app or session.
+ORIGINAL_OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+ORIGINAL_OPENAI_API_BASE = os.environ.get("OPENAI_API_BASE")
+ORIGINAL_OPENAI_MODEL = os.environ.get("OPENAI_MODEL_NAME") # Or other smol_dev relevant model env vars
+
+def set_smol_dev_env_for_openai(api_key, model_name=None):
     """
-    Connects to the Ollama API and fetches the list of locally available models.
-
-    Returns:
-        list: A list of model names (e.g., ['llama3:latest', 'mistral:latest']).
-              Returns an empty list if Ollama is running but has no models.
-
-    Raises:
-        ConnectionError: If it cannot connect to the Ollama server or an API error occurs.
+    Configures environment variables for smol_dev to use OpenAI.
+    It ensures that `OPENAI_API_KEY` is set and, if provided, `OPENAI_MODEL_NAME`.
+    Crucially, it resets `OPENAI_API_BASE` to its original state (or unsets it)
+    to prevent accidental routing to a local/Ollama endpoint if it was previously set.
     """
-    try:
-        client = ollama.Client() # Assumes default host (http://localhost:11434)
-        models_info = client.list()
-        # Extract model names, e.g., "llama2:latest"
-        model_names = [model['name'] for model in models_info['models']]
-        if not model_names:
-            # Ollama is running but no models have been pulled/created
-            return []
-        return model_names
-    except Exception as e:
-        # Broad exception catch, as errors can range from connection issues to unexpected API responses
-        # Log the error for server-side debugging if a logging framework was integrated
-        # print(f"Error fetching Ollama models: {e}")
-        raise ConnectionError(f"Could not connect to Ollama or fetch models: {e}")
+    os.environ["OPENAI_API_KEY"] = api_key
+    if model_name:
+        os.environ["OPENAI_MODEL_NAME"] = model_name # For smol_dev to pick up the specific model
 
-# --- Document Processing ---
-def load_document(uploaded_file):
+    # Reset OPENAI_API_BASE to default for OpenAI calls
+    if ORIGINAL_OPENAI_API_BASE: # If there was an original base (e.g., for Azure OpenAI), restore it
+        os.environ["OPENAI_API_BASE"] = ORIGINAL_OPENAI_API_BASE
+    elif "OPENAI_API_BASE" in os.environ: # If no original, but it was set (e.g., for Ollama previously), remove it
+        del os.environ["OPENAI_API_BASE"]
+
+def set_smol_dev_env_for_ollama(ollama_model_name, ollama_api_base="http://localhost:11434/v1"):
     """
-    Loads an uploaded file (PDF, TXT, MD) and extracts its text content.
-    Uses a temporary file to reliably pass the file path to Langchain loaders.
+    Configures environment variables to (experimentally) make smol_dev use an Ollama endpoint.
+    This function sets `OPENAI_API_KEY` to a dummy value (as some clients require it to be non-empty),
+    `OPENAI_API_BASE` to the Ollama server's OpenAI-compatible API endpoint, and
+    `OPENAI_MODEL_NAME` to the selected Ollama model.
+
+    **Experimental Note**: Success depends on the Ollama server correctly mimicking the
+    OpenAI API and `smol_dev` respecting these environment variables for its API calls.
+    """
+    os.environ["OPENAI_API_KEY"] = "ollama_is_great" # Dummy key, as Ollama doesn't use it but client might check
+    os.environ["OPENAI_API_BASE"] = ollama_api_base
+    os.environ["OPENAI_MODEL_NAME"] = ollama_model_name # Pass the specific Ollama model name
+
+def restore_original_env():
+    """
+    Restores OpenAI-related environment variables to their original state
+    that was captured at application startup. This is critical to call after
+    each `smol_dev` operation to ensure subsequent operations (or other parts
+    of a larger app) are not affected by temporary changes.
+    """
+    # Restore OPENAI_API_KEY
+    if ORIGINAL_OPENAI_API_KEY:
+        os.environ["OPENAI_API_KEY"] = ORIGINAL_OPENAI_API_KEY
+    elif "OPENAI_API_KEY" in os.environ: # If no original key, but one was set by us (e.g., dummy for Ollama)
+        del os.environ["OPENAI_API_KEY"]
+
+    # Restore OPENAI_API_BASE
+    if ORIGINAL_OPENAI_API_BASE:
+        os.environ["OPENAI_API_BASE"] = ORIGINAL_OPENAI_API_BASE
+    elif "OPENAI_API_BASE" in os.environ: # If no original base, but one was set (e.g., for Ollama)
+        del os.environ["OPENAI_API_BASE"]
+
+    # Restore OPENAI_MODEL_NAME (or other smol_dev relevant model env var)
+    if ORIGINAL_OPENAI_MODEL:
+        os.environ["OPENAI_MODEL_NAME"] = ORIGINAL_OPENAI_MODEL
+    elif "OPENAI_MODEL_NAME" in os.environ: # If no original model, but one was set
+        del os.environ["OPENAI_MODEL_NAME"]
+
+# --- smol_dev based response generation ---
+def get_smol_dev_response(user_query: str, rag_context: str = None, selected_model_name: str = None, is_openai: bool = True):
+    """
+    Generates a chat response using the smol_dev library by prompting it to create
+    the content for a conceptual file "answer.txt".
+    This function handles setting up the environment for OpenAI or (experimentally) Ollama,
+    constructs a specialized prompt, invokes smol_dev's planning and generation steps,
+    and attempts to extract a clean textual answer.
 
     Args:
-        uploaded_file: The file object from `st.file_uploader`.
+        user_query (str): The user's input question.
+        rag_context (str, optional): Context retrieved from documents for RAG.
+        selected_model_name (str, optional): The name of the LLM to be used (OpenAI or Ollama).
+        is_openai (bool): True if an OpenAI model is selected, False for Ollama.
 
     Returns:
-        str: The extracted text content of the document.
-             Returns None if loading fails or the file type is unsupported (though
-             `st.file_uploader` should prevent unsupported types).
+        str: The generated textual response or an error message if issues occur.
+    """
+    if not SMOL_DEV_AVAILABLE:
+        # This message is crucial if smol_dev is not installed.
+        # The dummy functions also raise NotImplementedError, which should be caught here if called directly,
+        # but this check prevents deeper calls if the import itself failed.
+        return "Error: smol_dev library is not available. Please ensure it's installed (e.g., `pip install smol_dev`)."
+
+    # 1. Configure LLM environment for smol_dev
+    # This step is critical for directing smol_dev to the correct LLM.
+    if is_openai:
+        if not ORIGINAL_OPENAI_API_KEY: # Check if original key was available at app start
+            return "Error: OPENAI_API_KEY was not found in the environment when the app started. Cannot use OpenAI with smol_dev."
+        set_smol_dev_env_for_openai(ORIGINAL_OPENAI_API_KEY, selected_model_name)
+    else: # Ollama (Highly Experimental Path)
+        # Warn user about the experimental nature of using Ollama with smol_dev.
+        st.sidebar.warning(
+            f"Attempting to use smol_dev with Ollama model '{selected_model_name}'. "
+            "This is highly experimental and relies on Ollama's OpenAI API compatibility."
+        )
+        set_smol_dev_env_for_ollama(selected_model_name) # Default base: http://localhost:11434/v1
+
+    response_content = ""
+    try:
+        # 2. Construct the Master Prompt for smol_dev
+        # The prompt is engineered to make smol_dev act like a text generator for a single file, "answer.txt".
+        # It explicitly tells smol_dev to focus on the answer and avoid code-generation boilerplate.
+        master_prompt = f"""You are an AI assistant. Your primary goal is to provide a direct, helpful, and informative textual answer to the user's query.
+Imagine you are creating the content for a single file named 'answer.txt'.
+The entire output you generate should be the content of this 'answer.txt' file.
+Do NOT generate any other file names, code structures, project plans, or explanations about your file generation process.
+Focus SOLELY on composing the textual answer to the user's query.
+The answer should be well-formatted plain text, suitable for display in a chat interface. Avoid markdown if not essential for the answer.
+
+User Query:
+{user_query}
+"""
+        if rag_context:
+            master_prompt += f"""
+
+Available Context (use this to inform your answer if relevant; if not relevant, please ignore it):
+---
+{rag_context}
+---
+"""
+        master_prompt += "\nYour final output is the content for 'answer.txt'. It should be JUST the answer text, without any additional explanations or conversational fluff."
+
+        # 3. Call smol_dev.plan()
+        # This step generates a plan based on the master prompt. For our use case,
+        # the "plan" might be simple, but it's part of the smol_dev workflow.
+        # Uncomment st.info lines for detailed debugging of smol_dev's internal state.
+        # st.info(f"smol_dev: Using prompt for plan (first 300 chars): {master_prompt[:300]}...")
+        shared_deps = plan(master_prompt)
+        # st.info(f"smol_dev: Plan received (first 300 chars): {shared_deps[:300]}...")
+
+        # 4. Call smol_dev.specify_file_paths()
+        # We expect "answer.txt" due to our specific prompting.
+        # However, smol_dev might suggest other paths or none.
+        file_paths = specify_file_paths(master_prompt, shared_deps)
+        # st.info(f"smol_dev: File paths specified by smol_dev: {file_paths}")
+
+        # Determine the target file path for generation.
+        # Our prompt strongly suggests 'answer.txt', so we use it as a conceptual target.
+        conceptual_file_path = "answer.txt"
+        if not file_paths:
+            st.warning("smol_dev did not specify any output file paths. Will attempt to generate content for the conceptual 'answer.txt'.")
+        elif conceptual_file_path not in file_paths:
+            # If smol_dev suggests paths but not "answer.txt", we log this and pick the first one it suggests,
+            # hoping our prompt was strong enough to make it write the answer there.
+            st.warning(
+                f"smol_dev did not explicitly specify '{conceptual_file_path}'. "
+                f"Using the first path from smol_dev: '{file_paths[0]}' if available, otherwise falling back to '{conceptual_file_path}'."
+            )
+            conceptual_file_path = file_paths[0] if file_paths else conceptual_file_path
+
+
+        # 5. Call smol_dev.generate_code_sync()
+        # This is where smol_dev calls the LLM to generate the content for the specified file path.
+        # We expect this content to be our textual answer.
+        # st.info(f"smol_dev: Requesting generation for target file path: {conceptual_file_path}...")
+        generated_output = generate_code_sync(master_prompt, shared_deps, conceptual_file_path)
+
+        if generated_output is None:
+             response_content = "Error: smol_dev returned an empty response (None). This might indicate an issue with the LLM configuration, the model itself, or restrictive content filters."
+        else:
+            response_content = generated_output.strip()
+            # Post-processing: smol_dev might still wrap the output in boilerplate (e.g., "Writing to file...").
+            # The following lines attempt to clean common boilerplate patterns. More sophisticated cleaning might be needed
+            # depending on observed `smol_dev` behavior with different models.
+            lines = response_content.splitlines()
+            if lines and "writing to" in lines[0].lower() and (conceptual_file_path in lines[0].lower() or ".txt" in lines[0].lower()):
+                # If the first line looks like "Writing to answer.txt...", remove it.
+                response_content = "\n".join(lines[1:]).strip()
+
+            # Remove potential markdown code blocks if smol_dev wraps simple text in them.
+            if response_content.startswith("```text\n") and response_content.endswith("\n```"):
+                 response_content = response_content.removeprefix("```text\n").removesuffix("\n```").strip()
+            elif response_content.startswith("```\n") and response_content.endswith("\n```"): # Generic code block
+                 response_content = response_content.removeprefix("```\n").removesuffix("\n```").strip()
+
+
+            if not response_content: # If stripping boilerplate results in an empty string
+                response_content = ("smol_dev generated a response, but it appears to be empty after attempting to clean "
+                                    "common boilerplate. The raw output might have been just boilerplate or unintended formatting.")
+
+    except NotImplementedError:
+        # This error is specifically raised by our dummy smol_dev functions if the library wasn't imported.
+        # The st.error message would have already been shown by the dummy function.
+        response_content = "Error: smol_dev functions are not available. Please ensure the 'smol_dev' library is correctly installed."
+    except Exception as e:
+        st.error(f"An unexpected error occurred during smol_dev processing: {e}")
+        # Provide a more generic error to the user but log/print details for debugging.
+        # print(f"Full smol_dev error: {type(e).__name__} - {e}", file=sys.stderr) # Consider logging properly
+        response_content = f"Sorry, an error occurred while trying to generate the response using smol_dev. Details: {str(e)}"
+    finally:
+        # 6. CRITICAL: Restore original environment variables
+        # This prevents interference with subsequent operations or other parts of the application.
+        restore_original_env()
+        # st.info("smol_dev: Original environment variables restored.") # For debugging
+
+    return response_content
+
+# --- RAG Pipeline Functions ---
+def load_document(uploaded_file):
+    """
+    Loads an uploaded file (PDF, TXT, MD) and returns its text content.
+    Uses a temporary file to handle the uploaded file object for loaders.
     """
     if not uploaded_file:
         return None
 
     file_ext = os.path.splitext(uploaded_file.name)[1].lower()
-    tmp_file_path = "" # Initialize to ensure it's available in finally block
+    text_content = ""
+    tmp_file_path = "" # Initialize to ensure it's available for finally block
 
     try:
-        # Create a temporary file to save the uploaded content.
-        # This is often necessary because many Langchain loaders expect a file path.
         with tempfile.NamedTemporaryFile(delete=False, suffix=file_ext) as tmp_file:
             tmp_file.write(uploaded_file.getvalue())
             tmp_file_path = tmp_file.name
 
-        text_content = ""
         if file_ext == ".pdf":
             loader = PyPDFLoader(tmp_file_path)
-            documents = loader.load() # Returns a list of Langchain Document objects
+            documents = loader.load()
             text_content = "\n".join([doc.page_content for doc in documents])
         elif file_ext in [".txt", ".md"]:
             loader = TextLoader(tmp_file_path, encoding='utf-8')
             documents = loader.load()
-            if documents: # TextLoader returns a list with one Document
-                text_content = documents[0].page_content
+            if documents:
+                 text_content = documents[0].page_content
         else:
-            # This case should ideally not be reached due to `st.file_uploader` type restrictions.
             st.error(f"Unsupported file type: {file_ext}")
             return None
-        return text_content
+
     except Exception as e:
         st.error(f"Error loading document '{uploaded_file.name}': {e}")
         return None
     finally:
-        # Clean up the temporary file
         if tmp_file_path and os.path.exists(tmp_file_path):
             os.remove(tmp_file_path)
 
-def get_text_chunks(text):
-    """
-    Splits a given text into smaller, manageable chunks for processing by LLMs.
+    return text_content
 
-    Args:
-        text (str): The input text to be chunked.
-
-    Returns:
-        list: A list of text chunks (strings). Returns an empty list if input text is empty.
-    """
+def get_text_chunks(text: str):
+    """Splits text into manageable chunks."""
     if not text:
-        st.warning("No text content to chunk.")
         return []
-
     text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1000,  # Max size of each chunk
-        chunk_overlap=200, # Number of characters to overlap between chunks
-        length_function=len # Function to measure chunk length
+        chunk_size=1000,
+        chunk_overlap=200,
+        length_function=len
     )
     chunks = text_splitter.split_text(text)
-    if not chunks:
-        st.warning("Text content resulted in no chunks.")
-        return []
     return chunks
 
-def get_vector_store(text_chunks, selected_model_name):
+def get_vector_store(text_chunks: list, embedding_model_name: str, is_openai_embedding: bool):
     """
-    Creates a ChromaDB vector store from text chunks using appropriate embeddings.
-    It differentiates between OpenAI and Ollama models to select the correct embedding function.
-
+    Creates a vector store from text chunks using appropriate embeddings.
     Args:
-        text_chunks (list): A list of text chunks.
-        selected_model_name (str): The name of the LLM selected in the UI, used to
-                                   determine the embedding model type (OpenAI vs. Ollama).
-
+        text_chunks: List of text chunks.
+        embedding_model_name: Name of the embedding model to use (e.g., "gpt-3.5-turbo" for OpenAI default, or an Ollama model name).
+        is_openai_embedding: True if using OpenAI embeddings, False for Ollama.
     Returns:
-        langchain_core.vectorstores.VectorStoreRetriever: A retriever object for the created
-                                                         vector store, or None if creation fails.
+        A Chroma retriever instance or None if an error occurs.
     """
     if not text_chunks:
-        st.warning("No text chunks provided to create vector store.")
+        st.warning("No text chunks to process for vector store.")
         return None
-
-    # Determine if the selected model is an OpenAI model based on its prefix.
-    # This is a simplification; a more robust approach might involve explicit model type
-    # information passed from the UI or a central model configuration.
-    openai_model_prefixes = ("gpt-4", "gpt-3.5")
-    is_openai_model = selected_model_name.startswith(openai_model_prefixes)
 
     embeddings = None
-    if is_openai_model:
-        try:
-            if not os.getenv("OPENAI_API_KEY"):
-                st.error("OpenAI API key (OPENAI_API_KEY) is not set in environment variables. "
-                         "Cannot create embeddings for OpenAI models.")
-                return None
-            embeddings = OpenAIEmbeddings()
-        except Exception as e:
-            st.error(f"Error initializing OpenAI embeddings: {e}")
-            return None
-    else: # Assume Ollama model
-        try:
-            # IMPORTANT: Using the selected Ollama *chat* model for embeddings.
-            # This may not be optimal as chat models are not always specialized for embeddings.
-            # Dedicated Ollama embedding models (e.g., 'nomic-embed-text', 'mxbai-embed-large')
-            # would be better. The UI currently doesn't differentiate.
-            # If the selected Ollama model is not suitable for embeddings, this step might fail
-            # or produce suboptimal embeddings.
-
-            # Check if the Ollama model exists and is accessible.
-            # This helps provide a more specific error if the model is unsuitable for embeddings.
-            try:
-                ollama_client_check = ollama.Client()
-                ollama_client_check.show(selected_model_name) # Throws ResponseError if model not found
-                embeddings = OllamaEmbeddings(model=selected_model_name)
-            except ollama.ResponseError as e:
-                 st.error(f"Ollama model '{selected_model_name}' not found or not suitable for generating embeddings. Error: {e}")
-                 st.info("Please ensure the selected Ollama model supports embeddings, or try a dedicated Ollama embedding model "
-                         "(e.g., 'nomic-embed-text', 'mxbai-embed-large') if available and pulled locally.")
-                 return None
-            except ConnectionError as e: # More specific catch for Ollama connection issues
-                st.error(f"Failed to connect to Ollama server for embeddings: {e}")
-                return None
-        except Exception as e: # Catch-all for other Ollama embedding initialization errors
-            st.error(f"Error initializing Ollama embeddings with model '{selected_model_name}': {e}")
-            return None
-
-    if embeddings is None:
-        # This should ideally be caught by earlier specific error handling.
-        st.error("Failed to initialize any embeddings model.")
-        return None
-
     try:
-        # Create an in-memory Chroma vector store from the text chunks and embeddings.
+        if is_openai_embedding:
+            if not os.getenv("OPENAI_API_KEY"):
+                st.error("OpenAI API key is not set. Cannot create embeddings for OpenAI models.")
+                return None
+            # For OpenAI, embedding_model_name can be specified if needed, e.g., "text-embedding-ada-002"
+            # Using default OpenAIEmbeddings behavior if a generic chat model name is passed.
+            embeddings = OpenAIEmbeddings()
+        else: # Ollama embeddings
+            # Here, embedding_model_name should be a specific Ollama model that can provide embeddings.
+            # e.g., "nomic-embed-text", "mxbai-embed-large", or even a general model like "llama3" if it's capable.
+            # The user must ensure the specified Ollama model in the UI is suitable for embeddings.
+            import ollama # Import here to avoid error if ollama is not configured and this path isn't taken.
+            try:
+                # Check if the ollama server is running and the model is available.
+                # This doesn't guarantee it's a good *embedding* model, but it's a basic check.
+                ollama.list() # Basic connection check
+                embeddings = OllamaEmbeddings(model=embedding_model_name)
+            except Exception as e:
+                st.error(f"Failed to initialize or connect to Ollama for embeddings with model '{embedding_model_name}': {e}")
+                st.info("Ensure Ollama is running and the selected model supports embeddings or choose a dedicated embedding model.")
+                return None
+
+        if embeddings is None:
+             st.error("Failed to initialize any embedding model.")
+             return None
+
         vector_store = Chroma.from_texts(texts=text_chunks, embedding=embeddings)
-        return vector_store.as_retriever() # Return a retriever for querying
+        return vector_store.as_retriever()
+
     except Exception as e:
-        st.error(f"Error creating ChromaDB vector store: {e}")
+        st.error(f"Error creating vector store: {e}")
         return None
 
-# --- Chat Logic ---
-def format_rag_prompt(context, question):
+# --- Ollama Integration (for model listing) ---
+def get_ollama_models_list(): # Renamed to avoid conflict if an old get_ollama_models existed
     """
-    Formats a prompt for Retrieval Augmented Generation (RAG) by combining
-    retrieved context with the user's question.
-
-    Args:
-        context (str): The retrieved context relevant to the question.
-        question (str): The user's original question.
-
-    Returns:
-        str: A formatted prompt string ready for the LLM.
+    Connects to the Ollama API and fetches the list of locally available models.
+    Returns a list of model names. Handles connection errors gracefully.
     """
-    template = """Based on the following context, please answer the user's question. If the context does not contain the answer, clearly state that the context does not provide an answer. Do not try to make up information not present in the provided context.
+    try:
+        client = ollama.Client()
+        models_info = client.list()
+        model_names = [model['name'] for model in models_info['models']]
+        return model_names
+    except Exception: # Catch broad exception if Ollama is not running or accessible
+        return []
 
-Context:
-{retrieved_chunks}
 
-User Question:
-{user_question}"""
-    prompt_template = PromptTemplate.from_template(template)
-    return prompt_template.format(retrieved_chunks=context, user_question=question)
-
-def get_llm_response(user_query, selected_model_name, retriever=None):
-    """
-    Retrieves and streams a response from the selected LLM (OpenAI or Ollama).
-    If a retriever is provided, it performs RAG by fetching context before querying the LLM.
-
-    Args:
-        user_query (str): The user's input query.
-        selected_model_name (str): The name of the LLM to use.
-        retriever (langchain_core.vectorstores.VectorStoreRetriever, optional):
-            The retriever for RAG. If None, RAG is skipped.
-
-    Yields:
-        str: Chunks of the LLM's response as they are generated (for streaming).
-             Can also yield error messages if issues occur.
-    """
-    openai_model_prefixes = ("gpt-4", "gpt-3.5") # Consistent with get_vector_store
-    is_openai_model = selected_model_name.startswith(openai_model_prefixes)
-
-    final_prompt_for_llm = user_query
-
-    if retriever:
-        try:
-            # 1. Retrieve relevant chunks using the provided query
-            # Note: retriever.invoke returns a list of Document objects
-            relevant_documents = retriever.invoke(user_query)
-
-            # 2. Format the retrieved documents into a single context string
-            context_str = "\n\n---\n\n".join([doc.page_content for doc in relevant_documents])
-
-            if not context_str:
-                st.warning("RAG: No relevant context found for the query.")
-                # Proceed with the original query without context, or inform user
-            else:
-                # 3. Construct the RAG prompt using the formatted context and original query
-                final_prompt_for_llm = format_rag_prompt(context=context_str, question=user_query)
-                # Optional: Display context for debugging
-                # st.sidebar.text_area("RAG Context Retrieved:", value=context_str, height=200)
-        except Exception as e:
-            st.error(f"Error during RAG context retrieval: {e}")
-            # Fallback: Proceed with the original query if RAG fails, or yield an error message
-            # For now, we let it proceed with the original query (final_prompt_for_llm is still user_query)
-            # Alternatively, could yield f"Error during RAG: {e}. Please try a simpler query or without a document. " and return
-
-    # Select and call the appropriate LLM client
-    if is_openai_model:
-        try:
-            if not os.getenv("OPENAI_API_KEY"):
-                st.error("OpenAI API key (OPENAI_API_KEY) not set. Cannot query OpenAI models.")
-                yield "Error: OpenAI API key not configured. Please set it as an environment variable. "
-                return
-
-            client = ChatOpenAI(model_name=selected_model_name, temperature=0.7, streaming=True)
-            messages = [{"role": "user", "content": final_prompt_for_llm}]
-
-            for chunk in client.stream(messages):
-                if chunk.content: # Ensure content is not None
-                    yield chunk.content
-        except Exception as e: # Broad catch for OpenAI client errors
-            st.error(f"Error with OpenAI model '{selected_model_name}': {e}")
-            yield f"Sorry, an error occurred while communicating with OpenAI: {str(e)}. "
-    else: # Ollama model
-        try:
-            ollama_client = ollama.Client()
-            # No explicit check for ollama_client.show(selected_model_name) here,
-            # as the model selection dropdown should be populated with available models.
-            # If a model is selected, it's assumed to exist. Errors during chat will be caught.
-
-            response_stream = ollama_client.chat(
-                model=selected_model_name,
-                messages=[{'role': 'user', 'content': final_prompt_for_llm}],
-                stream=True
-            )
-            for chunk in response_stream:
-                if chunk['message']['content']: # Ensure content is not None
-                    yield chunk['message']['content']
-        except ollama.ResponseError as e: # Specific error from Ollama API
-            st.error(f"Ollama API error for model '{selected_model_name}': {e.status_code} - {e.error}")
-            yield f"Error with Ollama model '{selected_model_name}': {e.error}. Please ensure the model is running and accessible. "
-        except ConnectionError as e: # Ollama connection error
-            st.error(f"Could not connect to Ollama server: {e}")
-            yield "Error: Could not connect to Ollama server. Please ensure Ollama is running. "
-        except Exception as e: # Other Ollama errors
-            st.error(f"Error with Ollama model '{selected_model_name}': {e}")
-            yield f"Sorry, an error occurred while communicating with Ollama: {str(e)}. "
-
-# --- Streamlit UI ---
+# --- Main Streamlit App ---
 def main():
-    """
-    Main function to run the Streamlit application.
-    Sets up the UI, handles user interactions, and manages the chat flow.
-    """
-    st.set_page_config(page_title="Advanced RAG Chatbot", layout="wide")
-    st.title("✨ Advanced RAG Chatbot ✨")
+    st.title("Chatbot with smol_dev and RAG")
 
-    # --- Sidebar for Configuration ---
+    # --- Sidebar ---
     with st.sidebar:
-        st.header("⚙️ Configuration")
+        st.header("Configuration")
 
-        # Model Selection Logic
-        openai_models = ["gpt-4o", "gpt-3.5-turbo"] # Predefined OpenAI models
-        ollama_display_models = []
-        try:
-            local_ollama_models = get_ollama_models()
-            if not local_ollama_models:
-                ollama_display_models = ["No Ollama models found (pull models first)"]
-            else:
-                ollama_display_models = local_ollama_models
-        except ConnectionError as e:
-            # Display connection error in the list of models for user awareness
-            ollama_display_models = [f"Ollama N/A (Error: {e})"]
-            # Optionally, show a more prominent error/warning in the sidebar
-            # st.warning(f"Could not connect to Ollama: {e}")
-        except Exception as e: # Catch any other unexpected errors from get_ollama_models
-            ollama_display_models = [f"Ollama N/A (Error: {e})"]
-            # st.error(f"An unexpected error occurred while fetching Ollama models: {e}")
+        # Model Selection
+        openai_models = ["gpt-4o", "gpt-3.5-turbo"] # Add more as needed
 
-        # Combine OpenAI and Ollama models for the selectbox
-        # Handle cases where Ollama models might be error messages
-        if ollama_display_models and ("N/A" in ollama_display_models[0] or "No Ollama models found" in ollama_display_models[0]):
-            combined_models = openai_models + ollama_display_models # Show error/status in dropdown
+        local_ollama_models = get_ollama_models_list()
+        if not local_ollama_models:
+            ollama_display_option = ["Ollama N/A (No models or connection error)"]
+            available_models = openai_models + ollama_display_option
         else:
-            combined_models = openai_models + ollama_display_models
+            available_models = openai_models + local_ollama_models
 
-        selected_model = st.selectbox("Choose a Model:", combined_models)
+        selected_model_name = st.selectbox("Choose a Model", available_models)
 
-        st.markdown("---")
-        st.subheader("📄 Document for RAG")
+        is_openai_selected = selected_model_name in openai_models
+
+        # For RAG embeddings, we'll use the type of the selected chat model.
+        # If an Ollama model is chosen for chat, we'll attempt to use it (or a related one) for embeddings.
+        # This simplifies the UI but assumes the chosen Ollama model can also serve as an embedding model
+        # or that OllamaEmbeddings can handle it. This is often not ideal for Ollama.
+        # A dedicated embedding model selector for Ollama would be more robust.
+        embedding_model_for_rag = selected_model_name
+        is_openai_embedding_model = is_openai_selected
+
+        st.info(f"""**Note on smol_dev & Models:**
+        - OpenAI models are expected to work with `smol_dev`.
+        - Ollama model usage with `smol_dev` is **experimental** and relies on Ollama mimicking the OpenAI API and `smol_dev` respecting environment variables for API base. This may not work as `smol_dev` is not designed for it.
+        - For RAG with Ollama, the selected Ollama chat model ('{selected_model_name}') will also be attempted for embeddings. This might not be optimal; dedicated embedding models are usually better.
+        """)
+
         # File Uploader for RAG
-        uploaded_file = st.file_uploader(
-            "Upload a document (PDF, TXT, MD) to chat with:",
-            type=['txt', 'md', 'pdf'],
-            key="file_uploader" # Key helps maintain state across reruns
-        )
+        uploaded_file = st.file_uploader("Upload a document for RAG", type=['txt', 'md', 'pdf'], key="file_uploader")
 
-        # Initialize session state variables for RAG components if they don't exist
         if "retriever" not in st.session_state:
             st.session_state.retriever = None
         if "processed_file_name" not in st.session_state:
             st.session_state.processed_file_name = None
 
         if uploaded_file:
-            # Process the file only if it's new or different from the currently processed one
             if st.session_state.processed_file_name != uploaded_file.name:
-                with st.spinner(f"⏳ Processing '{uploaded_file.name}'..."):
+                with st.spinner(f"Processing {uploaded_file.name}..."):
                     raw_text = load_document(uploaded_file)
                     if raw_text:
                         text_chunks = get_text_chunks(raw_text)
                         if text_chunks:
-                            # Create vector store and retriever, pass selected_model for embedding choice
-                            st.session_state.retriever = get_vector_store(text_chunks, selected_model)
+                            st.session_state.retriever = get_vector_store(
+                                text_chunks,
+                                embedding_model_name=embedding_model_for_rag,
+                                is_openai_embedding=is_openai_embedding_model
+                            )
                             if st.session_state.retriever:
                                 st.session_state.processed_file_name = uploaded_file.name
-                                st.success(f"✅ Document '{uploaded_file.name}' processed and ready for RAG!")
+                                st.success(f"Document '{uploaded_file.name}' processed for RAG.")
                             else:
-                                # Error messages are shown by get_vector_store
-                                st.error(f"❌ Could not create RAG retriever for '{uploaded_file.name}'. See errors above.")
-                                st.session_state.processed_file_name = None # Reset if processing failed
-                                st.session_state.retriever = None
+                                st.error(f"Could not create RAG retriever for '{uploaded_file.name}'. See logs if any.")
+                                st.session_state.processed_file_name = None # Reset on failure
                         else:
-                            # Warnings/errors shown by get_text_chunks
-                            st.warning(f"⚠️ No text chunks extracted from '{uploaded_file.name}'. Cannot set up RAG.")
+                            st.warning(f"No text chunks extracted from '{uploaded_file.name}'. Cannot set up RAG.")
                             st.session_state.processed_file_name = None
-                            st.session_state.retriever = None
                     else:
-                        # Error messages are shown by load_document
-                        st.error(f"❌ Failed to load document: '{uploaded_file.name}'.")
+                        st.error(f"Failed to load document: '{uploaded_file.name}'.")
                         st.session_state.processed_file_name = None
-                        st.session_state.retriever = None
             elif st.session_state.retriever:
-                # If the same file is still in the uploader, and it's already processed and retriever exists
-                st.success(f"✅ Document '{uploaded_file.name}' is already processed and ready for RAG.")
-        elif st.session_state.processed_file_name:
-            # If no file is currently uploaded, but one was processed before, offer to clear it.
-            st.info(f"Currently using '{st.session_state.processed_file_name}' for RAG.")
-            if st.button("Clear loaded document context"):
-                st.session_state.retriever = None
-                st.session_state.processed_file_name = None
-                st.rerun()
+                st.success(f"Document '{uploaded_file.name}' is already processed and ready for RAG.")
+
+        if st.session_state.retriever and st.button("Clear Loaded Document"):
+            st.session_state.retriever = None
+            st.session_state.processed_file_name = None
+            st.rerun() # Rerun to update UI after clearing
 
 
     # --- Main Chat Interface ---
-    # Initialize chat history in session state if it doesn't exist
     if "messages" not in st.session_state:
         st.session_state.messages = []
 
-    # Display existing chat messages
     for message in st.session_state.messages:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
 
-    # Handle new chat input
-    if prompt := st.chat_input("Ask your question here..."):
+    if prompt := st.chat_input("What is your question?"):
         st.session_state.messages.append({"role": "user", "content": prompt})
         with st.chat_message("user"):
             st.markdown(prompt)
 
-        # Generate and display assistant's response
         with st.chat_message("assistant"):
-            response_placeholder = st.empty() # For streaming effect
-            full_response_content = ""
+            response_placeholder = st.empty()
+            full_response = "Thinking..." # Initial placeholder message
+            response_placeholder.markdown(full_response + "▌")
 
-            # Retrieve current retriever from session state (it might be None if no doc uploaded/processed)
-            current_retriever = st.session_state.get("retriever")
+            rag_context_str = None
+            if st.session_state.retriever:
+                try:
+                    # Retrieve context based on the user's prompt
+                    retrieved_docs = st.session_state.retriever.invoke(prompt)
+                    rag_context_str = "\n\n---\n\n".join([doc.page_content for doc in retrieved_docs])
+                    if rag_context_str:
+                        # Display a snippet of the RAG context in the sidebar for transparency/debugging
+                        with st.sidebar.expander("Retrieved RAG Context Snippet"):
+                            st.text(rag_context_str[:500] + "..." if len(rag_context_str) > 500 else rag_context_str)
+                    else:
+                        st.sidebar.info("RAG: No specific context found for this query.")
+                except Exception as e:
+                    st.sidebar.warning(f"RAG retrieval failed: {e}")
 
-            # Call LLM and stream response
-            try:
-                for chunk in get_llm_response(prompt, selected_model, current_retriever):
-                    if chunk: # Ensure chunk is not None or empty before appending
-                        full_response_content += chunk
-                        response_placeholder.markdown(full_response_content + "▌") # Simulate typing
-                response_placeholder.markdown(full_response_content) # Display final response
-            except Exception as e: # Catch any unexpected errors from the response generator
-                st.error(f"An unexpected error occurred while generating the response: {e}")
-                full_response_content = "Sorry, I encountered an unexpected error while trying to respond."
-                response_placeholder.markdown(full_response_content)
+            # Check for unavailable models or smol_dev library before calling response generation
+            if selected_model_name == "Ollama N/A (No models or connection error)":
+                full_response = "Cannot process request: Ollama is not available or no models were found. Please check your Ollama setup."
+            elif not SMOL_DEV_AVAILABLE:
+                 full_response = "Critical Error: smol_dev library is not installed or failed to import. This app requires smol_dev to function."
+            else:
+                # Generate response using smol_dev, potentially with RAG context
+                full_response = get_smol_dev_response(
+                    user_query=prompt,
+                    rag_context=rag_context_str,
+                    selected_model_name=selected_model_name,
+                    is_openai=is_openai_selected
+                )
 
-        # Add assistant's final response to chat history
-        st.session_state.messages.append({"role": "assistant", "content": full_response_content if full_response_content else "No response generated."})
+            response_placeholder.markdown(full_response) # Display final response
+
+        # Store the assistant's response in session state
+        st.session_state.messages.append({"role": "assistant", "content": full_response if full_response else "No response generated or an error occurred."})
 
 if __name__ == "__main__":
     main()

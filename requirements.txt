@@ -7,3 +7,4 @@ langchain-community
 chromadb
 pypdf
 tiktoken
+smol_dev
